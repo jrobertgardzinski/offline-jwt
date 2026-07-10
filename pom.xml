@@ -40,6 +40,15 @@
             <version>2.29.0</version>
             <scope>test</scope>
         </dependency>
+        <!-- the consumer's half of the JWKS contract: this library is THE consumer of
+             /.well-known/jwks.json (the services delegate to it); the generated pact (pacts/,
+             committed) is verified by microservice-security against its real controller -->
+        <dependency>
+            <groupId>au.com.dius.pact.consumer</groupId>
+            <artifactId>junit5</artifactId>
+            <version>4.6.17</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -56,6 +65,10 @@
                 <configuration>
                     <systemPropertyVariables>
                         <allure.results.directory>${project.build.directory}/allure-results</allure.results.directory>
+                        <!-- the contract test writes the pact here (committed, not target/) so the
+                             producer's provider test verifies it from a sibling checkout -->
+                        <pact.rootDir>${project.basedir}/pacts</pact.rootDir>
+                        <pact_do_not_track>true</pact_do_not_track>
                     </systemPropertyVariables>
                 </configuration>
             </plugin>
