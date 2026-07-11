@@ -108,6 +108,53 @@ class OfflineJwtVerifierTest {
         assertEquals(1, fetches.get(), "the refetched keys are cached, not refetched per request");
     }
 
+    @Test
+    void a_removed_key_stops_verifying_once_the_cache_goes_stale() throws Exception {
+        java.util.concurrent.atomic.AtomicReference<Instant> now =
+                new java.util.concurrent.atomic.AtomicReference<>(Instant.parse("2026-07-11T12:00:00Z"));
+        java.util.concurrent.atomic.AtomicReference<Map<String, java.security.PublicKey>> jwks =
+                new java.util.concurrent.atomic.AtomicReference<>(Map.of("kid-1", keys.getPublic()));
+        OfflineJwtVerifier verifier = new OfflineJwtVerifier(
+                jwks::get, mapper, java.time.Duration.ofMinutes(15), now::get);
+        String token = token(keys, "kid-1", "user@example.com", "[\"USER\"]",
+                Instant.now().getEpochSecond() + 3600, "microservice-security");
+
+        assertTrue(verifier.verify(token).isPresent());
+
+        // the emergency lever: the (compromised) key is pulled from the JWKS
+        jwks.set(Map.of("kid-2", otherKeys.getPublic()));
+        assertTrue(verifier.verify(token).isPresent(),
+                "within the max-age the cached key still serves — propagation is bounded, not instant");
+
+        now.set(now.get().plusSeconds(16 * 60));
+        assertTrue(verifier.verify(token).isEmpty(),
+                "past the max-age the revocation propagates — a known kid alone must not pin the cache forever");
+    }
+
+    @Test
+    void a_jwks_outage_keeps_the_last_good_keys_serving() throws Exception {
+        java.util.concurrent.atomic.AtomicReference<Instant> now =
+                new java.util.concurrent.atomic.AtomicReference<>(Instant.parse("2026-07-11T12:00:00Z"));
+        AtomicInteger fetches = new AtomicInteger();
+        java.util.concurrent.atomic.AtomicReference<Map<String, java.security.PublicKey>> jwks =
+                new java.util.concurrent.atomic.AtomicReference<>(Map.of("kid-1", keys.getPublic()));
+        OfflineJwtVerifier verifier = new OfflineJwtVerifier(
+                () -> { fetches.incrementAndGet(); return jwks.get(); },
+                mapper, java.time.Duration.ofMinutes(15), now::get);
+        String token = token(keys, "kid-1", "user@example.com", "[\"USER\"]",
+                Instant.now().getEpochSecond() + 3600, "microservice-security");
+
+        assertTrue(verifier.verify(token).isPresent());
+
+        jwks.set(Map.of());   // the JWKS goes dark
+        now.set(now.get().plusSeconds(16 * 60));
+        assertTrue(verifier.verify(token).isPresent(),
+                "an unreachable JWKS is an availability incident, not a revocation — the last good keys serve");
+        int afterOutage = fetches.get();
+        assertTrue(verifier.verify(token).isPresent());
+        assertTrue(fetches.get() > afterOutage, "a failed refresh keeps retrying, not silently pinning");
+    }
+
     // --- Helpers --------------------------------------------------------------
 
     private static KeyPair generate() {

@@ -31,9 +31,13 @@ import java.util.stream.StreamSupport;
  * against the public keys security serves at {@code /.well-known/jwks.json} and the caller is
  * read from the claims. One JWKS fetch amortises over every request — the deliberate trade-off is
  * revocation blindness: a logout or role change is invisible until the token's {@code exp}. Keys
- * are cached; an unknown {@code kid} triggers one refetch, which also covers security restarting
- * with fresh ephemeral keys. Every failure — malformed token, wrong algorithm, forged signature,
- * foreign issuer, expiry, unreachable JWKS — verifies to empty: the caller fails closed.
+ * are cached with a max-age (default 15 minutes): an unknown {@code kid} triggers one refetch
+ * (which also covers security restarting with fresh ephemeral keys), and a stale cache refetches
+ * too — so REMOVING a compromised key from the JWKS reaches every consumer within minutes, not
+ * at its next restart (the emergency kill-switch must propagate). A failed refetch keeps serving
+ * the last good keys rather than dropping every caller: an unreachable JWKS is an availability
+ * incident, not a revocation. Every per-token failure — malformed token, wrong algorithm, forged
+ * signature, foreign issuer, expiry — verifies to empty: the caller fails closed.
  */
 public final class OfflineJwtVerifier {
 
@@ -42,12 +46,23 @@ public final class OfflineJwtVerifier {
 
     private final Supplier<Map<String, PublicKey>> jwksFetcher;
     private final ObjectMapper mapper;
+    private final Duration keysMaxAge;
+    private final Supplier<Instant> clock;
     private final AtomicReference<Map<String, PublicKey>> cachedKeys = new AtomicReference<>(Map.of());
+    private volatile Instant fetchedAt = Instant.EPOCH;
 
     /** Full control of the key source — the constructor tests (and unusual transports) use. */
     public OfflineJwtVerifier(Supplier<Map<String, PublicKey>> jwksFetcher, ObjectMapper mapper) {
+        this(jwksFetcher, mapper, Duration.ofMinutes(15), Instant::now);
+    }
+
+    /** Plus control of time and the cache max-age — what the revocation-propagation tests use. */
+    public OfflineJwtVerifier(Supplier<Map<String, PublicKey>> jwksFetcher, ObjectMapper mapper,
+                              Duration keysMaxAge, Supplier<Instant> clock) {
         this.jwksFetcher = jwksFetcher;
         this.mapper = mapper;
+        this.keysMaxAge = keysMaxAge;
+        this.clock = clock;
     }
 
     /** The common case: fetch the JWKS from security over plain HTTP (JDK client, short timeouts). */
@@ -111,13 +126,21 @@ public final class OfflineJwtVerifier {
     }
 
     private PublicKey keyFor(String kid) {
-        PublicKey known = cachedKeys.get().get(kid);
-        if (known != null) {
-            return known;
+        Map<String, PublicKey> known = cachedKeys.get();
+        boolean stale = clock.get().isAfter(fetchedAt.plus(keysMaxAge));
+        if (!stale && known.containsKey(kid)) {
+            return known.get(kid);
         }
-        // unknown kid: maybe a rotation (or security restarted with fresh keys) — refetch once
+        // unknown kid (a rotation, or security restarted with fresh keys) or a stale cache (a
+        // removed key must stop verifying without waiting for this process to restart) — refetch
         Map<String, PublicKey> fresh = jwksFetcher.get();
+        if (fresh.isEmpty()) {
+            // the JWKS is unreachable: keep serving the last good keys (and retry next time —
+            // fetchedAt stays put) instead of turning a fetch hiccup into a total outage
+            return known.get(kid);
+        }
         cachedKeys.set(fresh);
+        fetchedAt = clock.get();
         return fresh.get(kid);
     }
 
