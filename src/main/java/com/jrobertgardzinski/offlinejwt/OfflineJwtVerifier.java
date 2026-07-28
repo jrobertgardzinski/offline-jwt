@@ -51,6 +51,18 @@ public final class OfflineJwtVerifier {
     private final AtomicReference<Map<String, PublicKey>> cachedKeys = new AtomicReference<>(Map.of());
     private volatile Instant fetchedAt = Instant.EPOCH;
 
+    /**
+     * How long an unknown kid must wait before it may provoke another JWKS fetch.
+     *
+     * <p>Short enough that a genuine key rotation still propagates in seconds, long enough that a
+     * stream of forged kids cannot turn this gate into a traffic amplifier pointed at the identity
+     * service. Separate from {@link #keysMaxAge}, which governs how long GOOD keys stay trusted.
+     */
+    private static final Duration REFETCH_FLOOR = Duration.ofSeconds(10);
+
+    private final Duration refetchFloor = REFETCH_FLOOR;
+    private volatile Instant lastFetchAttempt = Instant.EPOCH;
+
     /** Full control of the key source — the constructor tests (and unusual transports) use. */
     public OfflineJwtVerifier(Supplier<Map<String, PublicKey>> jwksFetcher, ObjectMapper mapper) {
         this(jwksFetcher, mapper, Duration.ofMinutes(15), Instant::now);
@@ -105,7 +117,12 @@ public final class OfflineJwtVerifier {
             }
             JsonNode claims = json(parts[1]);
             if (!EXPECTED_ISSUER.equals(claims.path("iss").asText())
-                    || claims.path("exp").asLong() <= Instant.now().getEpochSecond()) {
+                    // the INJECTED clock, not Instant.now(): security mints exp from an injected
+                    // java.time.Clock and its tests steer it, so a gate judging expiry by wall time
+                    // disagreed with the mint in any environment with a shifted clock — and made
+                    // expiry impossible to test offline by moving time, which is the whole point of
+                    // having the clock here (it used to govern only the JWKS cache)
+                    || claims.path("exp").asLong() <= clock.get().getEpochSecond()) {
                 return Optional.empty();
             }
             String subject = claims.path("sub").asText();
@@ -131,8 +148,17 @@ public final class OfflineJwtVerifier {
         if (!stale && known.containsKey(kid)) {
             return known.get(kid);
         }
-        // unknown kid (a rotation, or security restarted with fresh keys) or a stale cache (a
-        // removed key must stop verifying without waiting for this process to restart) — refetch
+        // A FLOOR on how often an unknown kid may provoke a fetch. Without it, any anonymous
+        // request carrying "Authorization: Bearer <token with a made-up kid>" turned into one HTTP
+        // GET against security's /.well-known/jwks.json — a fresh fetch never contains an invented
+        // kid, so every such request missed again. An unauthenticated caller therefore drove
+        // traffic to the identity service one-for-one, amplified across every service that runs
+        // this gate. A real rotation still propagates within the floor, and a flood of junk kids
+        // now costs at most one fetch per floor.
+        if (!stale && clock.get().isBefore(lastFetchAttempt.plus(refetchFloor))) {
+            return known.get(kid);
+        }
+        lastFetchAttempt = clock.get();
         Map<String, PublicKey> fresh = jwksFetcher.get();
         if (fresh.isEmpty()) {
             // the JWKS is unreachable: keep serving the last good keys (and retry next time —

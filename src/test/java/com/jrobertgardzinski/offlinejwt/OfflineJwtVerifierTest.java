@@ -109,6 +109,56 @@ class OfflineJwtVerifierTest {
     }
 
     @Test
+    void a_flood_of_forged_kids_cannot_be_used_to_hammer_the_identity_service() throws Exception {
+        // The variant the existing rotation test does NOT cover: a kid that is not in the JWKS
+        // BEFORE the fetch and still not in it after. Every miss used to provoke a fresh GET
+        // against security's /.well-known/jwks.json, so any anonymous caller could drive traffic
+        // to the identity service one request for one — amplified across every service running
+        // this gate. A floor bounds it without slowing a real rotation down.
+        java.util.concurrent.atomic.AtomicReference<Instant> now =
+                new java.util.concurrent.atomic.AtomicReference<>(Instant.parse("2026-07-28T12:00:00Z"));
+        AtomicInteger fetches = new AtomicInteger();
+        OfflineJwtVerifier verifier = new OfflineJwtVerifier(
+                () -> { fetches.incrementAndGet(); return Map.of("kid-1", keys.getPublic()); },
+                mapper, java.time.Duration.ofMinutes(15), now::get);
+
+        for (int forged = 0; forged < 50; forged++) {
+            String token = token(keys, "made-up-" + forged, "attacker@example.com", "[\"USER\"]",
+                    now.get().getEpochSecond() + 300, "microservice-security");
+            assertTrue(verifier.verify(token).isEmpty(), "a forged kid never verifies");
+        }
+
+        assertEquals(1, fetches.get(),
+                "fifty forged kids must not cost fifty fetches from the identity service");
+
+        // and the floor is a floor, not a freeze: a real rotation still lands moments later
+        now.set(now.get().plusSeconds(30));
+        String rotated = token(keys, "kid-1", "user@example.com", "[\"USER\"]",
+                now.get().getEpochSecond() + 300, "microservice-security");
+        assertTrue(verifier.verify(rotated).isPresent());
+    }
+
+    @Test
+    void expiry_is_judged_by_the_injected_clock_not_by_wall_time() throws Exception {
+        // security mints exp from an injected Clock and its own tests steer it; a gate reading
+        // Instant.now() disagreed with the mint in any environment with a shifted clock, and made
+        // expiry untestable offline by moving time
+        java.util.concurrent.atomic.AtomicReference<Instant> now =
+                new java.util.concurrent.atomic.AtomicReference<>(Instant.parse("2026-07-28T12:00:00Z"));
+        OfflineJwtVerifier verifier = new OfflineJwtVerifier(
+                () -> Map.of("kid-1", keys.getPublic()), mapper,
+                java.time.Duration.ofMinutes(15), now::get);
+        String token = token(keys, "kid-1", "user@example.com", "[\"USER\"]",
+                now.get().getEpochSecond() + 300, "microservice-security");
+
+        assertTrue(verifier.verify(token).isPresent(), "still valid at the injected now");
+
+        now.set(now.get().plusSeconds(301));
+
+        assertTrue(verifier.verify(token).isEmpty(), "and expired once the injected clock passes it");
+    }
+
+    @Test
     void a_removed_key_stops_verifying_once_the_cache_goes_stale() throws Exception {
         java.util.concurrent.atomic.AtomicReference<Instant> now =
                 new java.util.concurrent.atomic.AtomicReference<>(Instant.parse("2026-07-11T12:00:00Z"));
