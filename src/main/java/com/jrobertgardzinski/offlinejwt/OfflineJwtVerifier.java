@@ -155,7 +155,17 @@ public final class OfflineJwtVerifier {
         // traffic to the identity service one-for-one, amplified across every service that runs
         // this gate. A real rotation still propagates within the floor, and a flood of junk kids
         // now costs at most one fetch per floor.
-        if (!stale && clock.get().isBefore(lastFetchAttempt.plus(refetchFloor))) {
+        // NO !stale here, and that omission was the whole defect. Both guards used to carry it, so
+        // the moment the cache aged out — which is exactly what happens when security is
+        // unreachable, since a failed fetch deliberately leaves fetchedAt untouched — the floor
+        // stopped applying and EVERY verify() on EVERY consumer service made its own HTTP call.
+        // A 3 s connect timeout per user request, and a returning identity service met a flood of
+        // fetches one-for-one with traffic: precisely the amplification the floor exists to stop,
+        // available again to anyone sending a made-up kid.
+        //
+        // Serving a known key from a stale cache for at most one floor (10 s) is a far smaller
+        // price than that, and keysMaxAge (15 min) still governs how long stale keys are trusted.
+        if (clock.get().isBefore(lastFetchAttempt.plus(refetchFloor))) {
             return known.get(kid);
         }
         lastFetchAttempt = clock.get();

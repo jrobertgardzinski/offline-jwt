@@ -139,6 +139,32 @@ class OfflineJwtVerifierTest {
     }
 
     @Test
+    void an_unreachable_identity_service_is_not_hammered_once_the_cache_ages_out() throws Exception {
+        // The variant the floor test above does NOT cover: a cache that has gone stale. A failed
+        // fetch deliberately leaves fetchedAt where it was, so during an outage the cache is stale
+        // for ever — and the floor used to be skipped whenever it was. Every request on every
+        // consumer service then made its own HTTP call, each waiting out a connect timeout, and the
+        // identity service came back to a flood one-for-one with traffic.
+        java.util.concurrent.atomic.AtomicReference<Instant> now =
+                new java.util.concurrent.atomic.AtomicReference<>(Instant.parse("2026-07-28T12:00:00Z"));
+        AtomicInteger fetches = new AtomicInteger();
+        OfflineJwtVerifier verifier = new OfflineJwtVerifier(
+                () -> { fetches.incrementAndGet(); return Map.of(); },   // security is down
+                mapper, java.time.Duration.ofMinutes(15), now::get);
+        String token = token(keys, "kid-1", "user@example.com", "[\"USER\"]",
+                now.get().getEpochSecond() + 300, "microservice-security");
+
+        now.set(now.get().plusSeconds(1800));            // well past keysMaxAge: the cache is stale
+        for (int request = 0; request < 50; request++) {
+            verifier.verify(token);
+        }
+
+        assertEquals(1, fetches.get(),
+                "fifty requests during an outage must not become fifty calls to the service that"
+                        + " is already down");
+    }
+
+    @Test
     void expiry_is_judged_by_the_injected_clock_not_by_wall_time() throws Exception {
         // security mints exp from an injected Clock and its own tests steer it; a gate reading
         // Instant.now() disagreed with the mint in any environment with a shifted clock, and made
@@ -201,8 +227,22 @@ class OfflineJwtVerifierTest {
         assertTrue(verifier.verify(token).isPresent(),
                 "an unreachable JWKS is an availability incident, not a revocation — the last good keys serve");
         int afterOutage = fetches.get();
+
+        // The property being defended is that a failed refresh does NOT pin the cache for ever —
+        // recovery must happen without restarting the process. This used to be asserted as "the
+        // very next request fetches again", which is a stronger claim than the property needs and
+        // happens to describe the amplification the refetch floor exists to stop: during an outage
+        // that meant one HTTP call, and one connect timeout, per user request per service.
         assertTrue(verifier.verify(token).isPresent());
-        assertTrue(fetches.get() > afterOutage, "a failed refresh keeps retrying, not silently pinning");
+        assertEquals(afterOutage, fetches.get(),
+                "a second request within the floor rides the last good keys instead of dialling the"
+                        + " service that is already down");
+
+        now.set(now.get().plusSeconds(11));   // past the 10 s floor
+
+        assertTrue(verifier.verify(token).isPresent());
+        assertTrue(fetches.get() > afterOutage,
+                "and once the floor elapses the retry does happen — an outage is survived, not pinned");
     }
 
     // --- Helpers --------------------------------------------------------------
