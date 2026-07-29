@@ -61,7 +61,13 @@ public final class OfflineJwtVerifier {
     private static final Duration REFETCH_FLOOR = Duration.ofSeconds(10);
 
     private final Duration refetchFloor = REFETCH_FLOOR;
-    private volatile Instant lastFetchAttempt = Instant.EPOCH;
+    /**
+     * AtomicReference, not a volatile field: the floor is a check-then-act, and a burst of requests
+     * arriving together all read the same old value and all decided to fetch. Winning a
+     * compare-and-set is what makes exactly one of them go.
+     */
+    private final java.util.concurrent.atomic.AtomicReference<Instant> lastFetchAttempt =
+            new java.util.concurrent.atomic.AtomicReference<>(Instant.EPOCH);
 
     /** Full control of the key source — the constructor tests (and unusual transports) use. */
     public OfflineJwtVerifier(Supplier<Map<String, PublicKey>> jwksFetcher, ObjectMapper mapper) {
@@ -165,10 +171,15 @@ public final class OfflineJwtVerifier {
         //
         // Serving a known key from a stale cache for at most one floor (10 s) is a far smaller
         // price than that, and keysMaxAge (15 min) still governs how long stale keys are trusted.
-        if (clock.get().isBefore(lastFetchAttempt.plus(refetchFloor))) {
+        Instant now = clock.get();
+        Instant lastAttempt = lastFetchAttempt.get();
+        if (now.isBefore(lastAttempt.plus(refetchFloor))) {
             return known.get(kid);
         }
-        lastFetchAttempt = clock.get();
+        if (!lastFetchAttempt.compareAndSet(lastAttempt, now)) {
+            // somebody else is already going; serving the cached key beats a second call
+            return known.get(kid);
+        }
         Map<String, PublicKey> fresh = jwksFetcher.get();
         if (fresh.isEmpty()) {
             // the JWKS is unreachable: keep serving the last good keys (and retry next time —
