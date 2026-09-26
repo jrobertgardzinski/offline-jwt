@@ -135,6 +135,12 @@ public final class OfflineJwtVerifier {
             if (subject.isBlank()) {
                 return Optional.empty();
             }
+            // tokens minted before the subject became the user id carried the address AS the
+            // subject and no email claim; they stay readable until they expire
+            String email = claims.path("email").asText();
+            if (email.isBlank()) {
+                email = subject.contains("@") ? subject : null;
+            }
             Set<String> roles = claims.path("roles").isArray()
                     ? StreamSupport.stream(claims.path("roles").spliterator(), false)
                             .map(JsonNode::asText).collect(Collectors.toUnmodifiableSet())
@@ -142,7 +148,7 @@ public final class OfflineJwtVerifier {
             // absent on an older token counts as false — nothing is withheld from ordinary users,
             // only from privileged ones (fail-closed)
             boolean mfaCompliant = claims.path("mfaCompliant").asBoolean(false);
-            return Optional.of(new VerifiedToken(subject, roles, mfaCompliant));
+            return Optional.of(new VerifiedToken(subject, email, roles, mfaCompliant));
         } catch (Exception invalidTokenOrJwksDown) {
             return Optional.empty();
         }

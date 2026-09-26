@@ -46,6 +46,35 @@ class OfflineJwtVerifierTest {
     }
 
     @Test
+    void the_subject_is_the_user_id_and_the_address_is_its_own_claim() throws Exception {
+        OfflineJwtVerifier verifier = new OfflineJwtVerifier(
+                () -> Map.of("kid-1", keys.getPublic()), mapper);
+        String header = b64(("{\"alg\":\"EdDSA\",\"typ\":\"JWT\",\"kid\":\"kid-1\"}")
+                .getBytes(StandardCharsets.UTF_8));
+        String claims = b64(("{\"iss\":\"microservice-security\",\"sub\":\"0f8fad5b-d9cb-469f-a165-70867728950e\","
+                + "\"email\":\"user@example.com\",\"exp\":" + (Instant.now().getEpochSecond() + 300) + "}")
+                .getBytes(StandardCharsets.UTF_8));
+
+        Optional<VerifiedToken> verified = verifier.verify(signed(keys, header, claims));
+
+        assertTrue(verified.isPresent());
+        assertEquals("0f8fad5b-d9cb-469f-a165-70867728950e", verified.get().subject());
+        assertEquals("user@example.com", verified.get().email());
+    }
+
+    @Test
+    void an_older_token_with_the_address_as_subject_still_yields_the_address() throws Exception {
+        OfflineJwtVerifier verifier = new OfflineJwtVerifier(
+                () -> Map.of("kid-1", keys.getPublic()), mapper);
+        String token = token(keys, "kid-1", "user@example.com", "[\"USER\"]",
+                Instant.now().getEpochSecond() + 300, "microservice-security");
+
+        Optional<VerifiedToken> verified = verifier.verify(token);
+
+        assertEquals("user@example.com", verified.get().email(), "no email claim: the subject was the address");
+    }
+
+    @Test
     void a_token_without_a_roles_claim_is_a_plain_user() throws Exception {
         OfflineJwtVerifier verifier = new OfflineJwtVerifier(
                 () -> Map.of("kid-1", keys.getPublic()), mapper);

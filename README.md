@@ -2,8 +2,10 @@
 
 Offline verification of microservice-security's access tokens, as a library: the token's own
 EdDSA signature is verified against the JWKS security serves at `/.well-known/jwks.json`, and the
-caller (subject, roles, MFA floor) is read from the claims — no per-request introspection
-round-trip. The trade-off is revocation blindness until the token's `exp`; the payoff is that a
+caller is read from the claims — no per-request introspection round-trip. `subject` is
+security's stable user id (a UUID); the address rides as its own `email` claim. A token minted
+before that split (address as subject, no `email`) still verifies, with `email()` filled from the
+subject, until it expires. The trade-off is revocation blindness until the token's `exp`; the payoff is that a
 security outage or hot path does not cost a network hop per request.
 
 ```java
